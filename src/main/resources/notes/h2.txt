@@ -1,0 +1,12 @@
+CREATE TABLE TEST(ID INT auto_increment PRIMARY KEY,
+   tt VARCHAR(255));
+
+
+spring.datasource.url=jdbc:h2:file:./baza;DB_CLOSE_DELAY=-1
+# file is created if none present; tables created based on JPA
+# new column => column created
+# rename of column == drop old; create new (filled with nulls)
+#
+
+
+
