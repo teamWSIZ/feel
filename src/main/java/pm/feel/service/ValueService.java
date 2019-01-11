@@ -1,127 +1,98 @@
 package pm.feel.service;
 
-import com.google.common.util.concurrent.AtomicDouble;
+import com.google.common.base.Splitter;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import pm.feel.model.Device;
-import pm.feel.repo.DeviceRepo;
+import pm.feel.model.VoteResponse;
 
+import java.util.Date;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-
-import static com.google.common.base.Strings.isNullOrEmpty;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Stores values of all services in a way exposed to prometheus.
+ * Stores values of
  */
 @Service
 @Slf4j
-public class ValueService {
+public class ValueService implements InitializingBean {
     @Autowired MeterRegistry registry;  //prometheus gauges
-    @Autowired DeviceRepo deviceRepo;
 
-    /*
-     * gauge_name -> last value ;
-     * on startup gauges are recreated on each new update ;
-     * DB does not store gauge values, only names of devices and sensors ;
-     */
-    Map<String, AtomicDouble> values = new ConcurrentHashMap<>();
+    Map<String, Set<Long>> upVotes;
+    Map<String, Set<Long>> dnVotes;
+    Map<String, AtomicInteger> upVotesInPeriod;
+    Map<String, AtomicInteger> dnVotesInPeriod;
+    Set<String> rooms;
 
-    //non-null names are written to the device description
+    @Value("${rooms}")
+    String roomConfig;
+    @Value("${duration.persist.votes}") //default=1h
+    Long durationPersistVotes;
 
-    /**
-     * Makes sure device given by the MAC address is stored in the DB (of names of devices and sensors).
-     *
-     */
-    public Device identify(String mac, String name, String nameA, String nameB, String nameC) {
-        log.info("Device update request for mac=[{}], [{}], [{}], [{}], [{}]", mac, name, nameA, nameB, nameC);
-        if (mac==null) throw new RuntimeException("Identifying device while giving MAC=null");
-        Device d = deviceRepo.findByMacAddress(mac);
-        if (d==null) {
-            if (name==null) throw new RuntimeException("New device (MAC); `name` should not be null");
-            d = Device.default_(mac);
-        }
-        d.setName(name);
-        if (nameA!=null) d.setNameA(nameA);
-        if (nameB!=null) d.setNameB(nameB);
-        if (nameC!=null) d.setNameC(nameC);
-        deviceRepo.save(d);
-        log.info("Device identification updated: [{}]", d);
-        return d;
-    }
+    @Override
+    public void afterPropertiesSet() {
+        upVotes = new ConcurrentHashMap<>();
+        dnVotes = new ConcurrentHashMap<>();
+        upVotesInPeriod = new ConcurrentHashMap<>();
+        dnVotesInPeriod = new ConcurrentHashMap<>();
 
+        rooms = new HashSet<>(Splitter.on(",").trimResults().omitEmptyStrings().splitToList(roomConfig));
 
-    /**
-     * Functions:
-     * - mac not in DB --> register (and exit)
-     * - mac in DB, but not named --> exit
-     * - mac in DB, named -> store values (creating gauges if necessary)
-     */
-    public void update(String mac, Double valA, Double valB, Double valC) {
-        log.info("Update of [{}], with [{}], [{}], [{}]", mac, valA, valB, valC);
-        if (isNullOrEmpty(mac)) return;
-
-        Device d = deviceRepo.findByMacAddress(mac);
-        if (d==null) {
-            d = deviceRepo.save(Device.default_(mac)); //new registration; not yet identified
-            return;
-        }
-        String name = d.getName();
-        if (isNullOrEmpty(name)) return;
-        log.info("Device identified as [{}], storing values in gauges", name);
-
-        storeValue(gaugeName(d.getName(), d.getNameA()), valA);
-        storeValue(gaugeName(d.getName(), d.getNameB()), valB);
-        storeValue(gaugeName(d.getName(), d.getNameC()), valC);
-    }
-
-    /**
-     * Updates or creates&updates a gauge.
-     */
-    private void storeValue(String gaugeName, Double value) {
-        if (values.containsKey(gaugeName)) {
-            values.get(gaugeName).set(value);
-        } else {
-            AtomicDouble gauge = registry.gauge(gaugeName, new AtomicDouble(value));
-            values.put(gaugeName, gauge);
-        }
-        log.info("[{}] updated to [{}]", gaugeName, value);
-    }
-
-    private String gaugeName(String deviceName, String sensorName) {
-        return deviceName + "_" + sensorName;
-    }
-
-    /**
-     * - delete from DB
-     * - delete all gauges whose names start with "devicename_"
-     */
-    @Transactional
-    public void delete(String mac) {
-        log.warn("Deleting device with mac=[{}]", mac);
-        Device d = deviceRepo.findByMacAddress(mac);
-        if (d==null || d.getName()==null) return;
-        String prefix = d.getName() + "_";
-        Set<String> todelete = new HashSet<>();
-        for(String gaugeName : values.keySet()) {
-            if (gaugeName.startsWith(prefix)) todelete.add(gaugeName);
-        }
-        todelete.forEach(s -> {
-            log.warn("Removing gauge [{}]", s);
-            values.remove(s);
+        rooms.forEach(room -> {
+            AtomicInteger up = registry.gauge(room + "_up", new AtomicInteger(0));
+            AtomicInteger dn = registry.gauge(room + "_dn", new AtomicInteger(0));
+            upVotesInPeriod.put(room, up);
+            dnVotesInPeriod.put(room, dn);
+            Set<Long> u = new ConcurrentSkipListSet<>(), d = new ConcurrentSkipListSet<>();
+            upVotes.put(room, u);
+            dnVotes.put(room, d);
         });
-        deviceRepo.delete(d);
-        log.warn("Device deleted ");
-        cleanup();
     }
 
-    private void cleanup() {
-        log.warn("Cleaning up (removing) all devices with MAC=null");
-        deviceRepo.deleteByMacAddressIsNull();
+    public VoteResponse vote(String room, int val){
+        if (!upVotes.keySet().contains(room)) return new VoteResponse(-1,-1);
+        long now = new Date().getTime();
+        if (val==1) {
+            upVotes.get(room).add(now);
+        } else if (val==-1) {
+            dnVotes.get(room).add(now);
+        }
+        sweepOutOldTimestamps();
+        //counters/gauges will be updated by scheduler
+        return new VoteResponse(upVotesInPeriod.get(room).get(), dnVotesInPeriod.get(room).get());
+    }
+
+    @Scheduled(cron = "0/5 * * * * ?")
+    public void sweepOutOldTimestamps() {
+        log.info("Sweeping-out old votes");
+        long now = new Date().getTime();
+
+        rooms.forEach(room->{
+            final Set<Long> toremove = new HashSet<>();
+            upVotes.get(room).forEach(timestamp -> {
+                if (now - timestamp > durationPersistVotes) toremove.add(timestamp);
+            });
+            upVotes.get(room).removeAll(toremove);
+            toremove.clear();
+            dnVotes.get(room).forEach(timestamp -> {
+                if (now - timestamp > durationPersistVotes) toremove.add(timestamp);
+            });
+            dnVotes.get(room).removeAll(toremove);
+            ///
+            upVotesInPeriod.get(room).set(upVotes.get(room).size());
+            dnVotesInPeriod.get(room).set(dnVotes.get(room).size());
+        });
+    }
+
+    public Set<String> getRooms() {
+        return rooms;
     }
 }
