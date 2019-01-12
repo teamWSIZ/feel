@@ -70,7 +70,7 @@ public class ValueService implements InitializingBean {
         return new VoteResponse(upVotesInPeriod.get(room).get(), dnVotesInPeriod.get(room).get());
     }
 
-    @Scheduled(cron = "0/5 * * * * ?")
+    @Scheduled(cron = "0/30 * * * * ?")
     public void sweepOutOldTimestamps() {
         log.info("Sweeping-out old votes");
         long now = new Date().getTime();
